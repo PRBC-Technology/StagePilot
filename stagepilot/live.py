@@ -1,7 +1,8 @@
-"""Local browser preview. This program cannot issue PTZ camera commands."""
+"""Local browser preview with separate, explicit manual PTZ controls."""
 import argparse
 import json
 import importlib.util
+import os
 import secrets
 import threading
 import time
@@ -13,6 +14,7 @@ from urllib.parse import urlsplit
 import cv2
 
 from .live_detector import PersonDetector
+from .ptz import encode_pan_tilt, encode_zoom, send_packet, validate_camera_host
 
 ROOT = Path(__file__).resolve().parent
 MODEL = ROOT.parent / 'yolox.onnx'
@@ -38,12 +40,13 @@ def run_preview(url, cancel, backend='cpu'):
             return
         # Explicit open/read timeouts keep a disconnected stream from hanging indefinitely.
         options = [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000, cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000]
+        os.environ.setdefault('OPENCV_FFMPEG_CAPTURE_OPTIONS', 'rtsp_transport;tcp')
         capture = cv2.VideoCapture(str(url), cv2.CAP_FFMPEG, options)
         if not capture.isOpened():
             set_state(status='error', message='Could not open video. Check address, credentials and network access.')
             return
         label = 'DirectML requested' if backend == 'directml' else 'CPU'
-        set_state(status='running', message=f'Detection active · {label} · no camera control')
+        set_state(status='running', message=f'Detection active · {label} · manual PTZ only')
         latest = {'frame': None, 'version': 0, 'ended': False}
         frame_lock = threading.Lock()
 
@@ -154,6 +157,28 @@ class Handler(BaseHTTPRequestHandler):
                     stop_event.set()
                     set_state(status='stopping', message='Stopping preview…')
                 return self.reply(200, b'{}')
+            if self.path == '/ptz':
+                host = body['host']
+                port = body['port']
+                if not isinstance(host, str) or not host.strip():
+                    raise ValueError()
+                address = validate_camera_host(host.strip())
+                if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+                    raise ValueError()
+                action = body['action']
+                if action == 'pan_tilt':
+                    speed = body.get('speed', 12)
+                    packet = encode_pan_tilt(body['direction'], speed, speed)
+                    send_packet(address, port, packet)
+                elif action == 'zoom':
+                    packet = encode_zoom(body['direction'], body.get('speed', 2))
+                    send_packet(address, port, packet)
+                elif action == 'stop_all':
+                    send_packet(address, port, encode_pan_tilt('stop'))
+                    send_packet(address, port, encode_zoom('stop'))
+                else:
+                    raise ValueError()
+                return self.reply(200, b'{}')
             if self.path == '/fps':
                 fps = float(body['fps'])
                 if not 1 <= fps <= 30:
@@ -186,7 +211,13 @@ class Handler(BaseHTTPRequestHandler):
             worker.start()
             return self.reply(200, b'{}')
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            if self.path == '/ptz':
+                return self.reply(400, b'{"error":"Check the private camera IP, UDP port, and PTZ command."}')
             return self.reply(400, b'{"error":"Check the RTSP URL, frame rate and model file."}')
+        except OSError:
+            if self.path != '/ptz':
+                raise
+            return self.reply(502, b'{"error":"Could not send the PTZ command. Check the camera address and UDP port."}')
 
 
 def main():

@@ -1,0 +1,8 @@
+.venv/
+/yolox.onnx
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.m4v
+*.webm
